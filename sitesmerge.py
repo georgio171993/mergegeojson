@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-GeoJSON MultiPolygon Grouper & Splitter (Orbify Rule) - with Dedupe
-===================================================================
+GeoJSON MultiPolygon Grouper & Splitter (Orbify Rule) - with Dedupe + Ocean Check
+=================================================================================
 
 Purpose
 -------
 - Ingest one or more GeoJSON files (Polygon / MultiPolygon; others pass through).
 - Apply Orbify-style spatial efficiency **only to MultiPolygon** features:
-    * total_area_ha / bbox_area_ha >= 0.006  → keep as **single site**
-    * total_area_ha / bbox_area_ha <  0.006  → **split** into per-polygon sites
-- **Ignore MultiPoint** for this rule (log a warning; no ratio processing).
+    * total_area_ha / bbox_area_ha >= **threshold** → keep as **single site**
+    * total_area_ha / bbox_area_ha <  **threshold** → **split** into per-polygon sites
+  - **Threshold default:** `0.0011` (safer buffer where supported cutoff is 0.001).
+- **Ignore MultiPoint** for this rule (log a warning; completely skipped from ratio processing).
 - Optionally **cluster nearby Polygon sites** (across all inputs) into
   **MultiPolygon** sites when polygons are within a proximity (e.g., 2 km).
 - **De-duplicate** geometries so only one copy remains. Deduping works for:
@@ -17,6 +18,7 @@ Purpose
   * MultiPolygons that are duplicates of other MultiPolygons **or** equivalent
     to an existing Polygon set (e.g., a single-Polygon MultiPolygon).
   * Internal duplicates inside a MultiPolygon (drops repeated parts).
+- **Ocean check (optional):** if a landmask is provided, reject geometries that fall mostly in the ocean (configurable overlap ratio).
 - Export a clean GeoJSON FeatureCollection with final **Polygon**/**MultiPolygon** sites.
 
 Notes
@@ -31,13 +33,15 @@ Usage
 python orbify_sites.py \
   --inputs data/a.geojson data/b.geojson \
   --output out/sites_merged.geojson \
-  --ratio-threshold 0.006 \
+  --ratio-threshold 0.0011 \
   --cluster-distance-m 2000 \
-  --dedupe-tolerance-m 1.0
+  --dedupe-tolerance-m 1.0 \
+  --landmask data/land.geojson --min-land-overlap 0.95
 
 Dependencies
 ------------
   pip install shapely pyproj
+  # (for Streamlit UI) pip install streamlit pydeck
 
 """
 from __future__ import annotations
@@ -47,9 +51,17 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple, Set
+from typing import Dict, Iterable, List, Tuple, Set, Optional
 
-from shapely.geometry import shape, mapping, Polygon, MultiPolygon, GeometryCollection
+from shapely.geometry import (
+    shape,
+    mapping,
+    Polygon,
+    MultiPolygon,
+    GeometryCollection,
+    Point,
+    LineString,
+)
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union, transform as shp_transform
 from pyproj import Geod, CRS, Transformer
@@ -405,14 +417,88 @@ def dedupe_features(features: List[Feature], tolerance_m: float) -> List[Feature
     return out
 
 
+# --- OCEAN / LAND CHECK ------------------------------------------------------
+
+def load_landmask(path: Optional[Path]) -> Optional[BaseGeometry]:
+    """Load a landmask from a GeoJSON file (Feature or FeatureCollection). Returns a unified geometry.
+    The landmask should represent **land areas**. We unary_union all Polygon/MultiPolygon parts.
+    """
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        geoms: List[BaseGeometry] = []
+        if data.get("type") == "FeatureCollection":
+            for feat in data.get("features", []):
+                g = shape(feat.get("geometry")) if feat.get("geometry") else GeometryCollection()
+                if isinstance(g, (Polygon, MultiPolygon)):
+                    geoms.append(g)
+        elif data.get("type") == "Feature":
+            g = shape(data.get("geometry")) if data.get("geometry") else GeometryCollection()
+            if isinstance(g, (Polygon, MultiPolygon)):
+                geoms.append(g)
+        else:
+            logger.warning("Unsupported landmask top-level type: %s", data.get("type"))
+            return None
+        if not geoms:
+            logger.warning("Landmask has no polygonal geometry; ocean check disabled")
+            return None
+        return unary_union(geoms)
+    except Exception as e:
+        logger.error("Failed to load landmask: %s", e)
+        return None
+
+
+def filter_ocean(features: List[Feature], landmask: BaseGeometry, min_overlap_ratio: float = 0.95) -> List[Feature]:
+    """Reject features that fall mostly in ocean using the provided landmask.
+    - Polygons/MultiPolygons: keep if area(intersection)/area >= min_overlap_ratio.
+    - Points/MultiPoints: keep if within landmask.
+    - LineStrings: keep if they intersect landmask (len > 0).
+    - Others: passed through.
+    """
+    out: List[Feature] = []
+    dropped = 0
+    for f in features:
+        g = f.geom
+        try:
+            if isinstance(g, (Polygon, MultiPolygon)):
+                a = g.area if g.area > 0 else 1.0  # planar proxy used only for ratio; exactness not critical
+                inter = g.intersection(landmask)
+                ratio = 0.0 if g.is_empty else (inter.area / a)
+                if ratio >= min_overlap_ratio:
+                    out.append(f)
+                else:
+                    dropped += 1
+            elif isinstance(g, Point):
+                if landmask.contains(g) or landmask.touches(g):
+                    out.append(f)
+                else:
+                    dropped += 1
+            elif isinstance(g, LineString):
+                if not g.intersection(landmask).is_empty:
+                    out.append(f)
+                else:
+                    dropped += 1
+            else:
+                out.append(f)
+        except Exception:
+            # If geometry is invalid or operation fails, be conservative: drop
+            dropped += 1
+    logger.info("Ocean check: dropped %d feature(s) that fall in ocean (min_overlap=%.2f)", dropped, min_overlap_ratio)
+    return out
+
+
 # --- Pipeline ----------------------------------------------------------------
 
 def process(
     inputs: List[Path],
     output: Path,
-    ratio_threshold: float = 0.006,
+    ratio_threshold: float = 0.0011,
     cluster_distance_m: float = 0.0,
     dedupe_tolerance_m: float = 1.0,
+    landmask_path: Optional[Path] = None,
+    min_land_overlap: float = 0.95,
 ) -> None:
     feats = load_features(inputs)
 
@@ -425,6 +511,11 @@ def process(
 
     # Global geometric de-duplication
     feats = dedupe_features(feats, dedupe_tolerance_m)
+
+    # Optional ocean/land check
+    landmask = load_landmask(landmask_path)
+    if landmask is not None:
+        feats = filter_ocean(feats, landmask, min_land_overlap)
 
     # Assign site ids (stable index-based) & store area
     final = []
@@ -441,12 +532,14 @@ def process(
 # --- CLI ---------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Orbify-style MultiPolygon grouping, clustering, and deduplication for GeoJSON.")
+    ap = argparse.ArgumentParser(description="Orbify-style MultiPolygon grouping, clustering, deduplication, and ocean check for GeoJSON.")
     ap.add_argument("--inputs", nargs="+", type=Path, required=True, help="One or more input GeoJSON files")
     ap.add_argument("--output", type=Path, required=True, help="Output GeoJSON path")
-    ap.add_argument("--ratio-threshold", type=float, default=0.006, help="Threshold for area/bbox_area (default 0.006)")
+    ap.add_argument("--ratio-threshold", type=float, default=0.0011, help="Threshold for area/bbox_area (default 0.0011 for a safe buffer > 0.001)")
     ap.add_argument("--cluster-distance-m", type=float, default=0.0, help="Max distance (meters) to cluster polygons into MultiPolygons across inputs (0=off)")
     ap.add_argument("--dedupe-tolerance-m", type=float, default=1.0, help="Snap grid in meters for near-duplicate removal (0=exact only)")
+    ap.add_argument("--landmask", type=Path, default=None, help="Optional landmask GeoJSON path for ocean rejection (Feature or FeatureCollection)")
+    ap.add_argument("--min-land-overlap", type=float, default=0.95, help="Min area overlap with landmask to accept polygonal features [0-1]")
     ap.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging level")
     return ap.parse_args()
 
@@ -460,6 +553,8 @@ def main():
         ratio_threshold=args.ratio_threshold,
         cluster_distance_m=args.cluster_distance_m,
         dedupe_tolerance_m=args.dedupe_tolerance_m,
+        landmask_path=args.landmask,
+        min_land_overlap=args.min_land_overlap,
     )
 
 
@@ -470,21 +565,21 @@ def main():
 def streamlit_app():
     import streamlit as st
     import tempfile
-    import io
     import pydeck as pdk
 
     st.set_page_config(page_title="Orbify GeoJSON Grouper", layout="wide")
-    st.title("Orbify GeoJSON Grouper & Splitter (with Dedupe)")
+    st.title("Orbify GeoJSON Grouper & Splitter (with Dedupe + Ocean Check)")
 
     with st.sidebar:
         st.header("Parameters")
-        ratio = st.number_input("Ratio threshold (area/bbox)", value=0.006, min_value=0.0, step=0.001, format="%.3f")
+        ratio = st.number_input("Ratio threshold (area/bbox)", value=0.0011, min_value=0.0, step=0.0001, format="%.4f")
         cluster_m = st.number_input("Cluster distance (m)", value=2000.0, min_value=0.0, step=100.0)
         dedupe_m = st.number_input("Dedupe tolerance (m)", value=1.0, min_value=0.0, step=0.5)
+        min_overlap = st.slider("Min land overlap (0-1)", min_value=0.0, max_value=1.0, value=0.95, step=0.01)
         log_level = st.selectbox("Log level", ["DEBUG", "INFO", "WARNING", "ERROR"], index=1)
-
         st.markdown("---")
-        uploaded = st.file_uploader("Upload one or more GeoJSON files", type=["json","geojson"], accept_multiple_files=True)
+        uploaded = st.file_uploader("Upload GeoJSON files (one or more)", type=["json","geojson"], accept_multiple_files=True)
+        landmask_file = st.file_uploader("Optional landmask GeoJSON (polygons of LAND)", type=["json","geojson"], accept_multiple_files=False)
         run_btn = st.button("Process")
 
     logger.setLevel(getattr(logging, log_level))
@@ -502,6 +597,11 @@ def streamlit_app():
                 p.write_bytes(uf.getvalue())
                 tmp_paths.append(p)
 
+            landmask_path = None
+            if landmask_file is not None:
+                landmask_path = Path(td) / ("landmask_" + landmask_file.name)
+                landmask_path.write_bytes(landmask_file.getvalue())
+
             out_path = Path(td) / "sites_merged.geojson"
             try:
                 process(
@@ -510,6 +610,8 @@ def streamlit_app():
                     ratio_threshold=ratio,
                     cluster_distance_m=cluster_m,
                     dedupe_tolerance_m=dedupe_m,
+                    landmask_path=landmask_path,
+                    min_land_overlap=min_overlap,
                 )
             except Exception as e:
                 st.error(f"Processing failed: {e}")
@@ -540,7 +642,6 @@ def streamlit_app():
                 )
                 view_state = pdk.ViewState(latitude=0, longitude=0, zoom=1)
                 if feats:
-                    # center on first feature's centroid
                     try:
                         from shapely.geometry import shape as _shape
                         first = _shape(feats[0].get("geometry"))

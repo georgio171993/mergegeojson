@@ -561,12 +561,19 @@ def streamlit_app():
             )
 
 
+def _running_in_streamlit() -> bool:
+    """Detect if this file is being executed by Streamlit."""
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx  # type: ignore
+        return get_script_run_ctx() is not None
+    except Exception:
+        return False
+
+
 if __name__ == "__main__":
-    # If run as a CLI script: `python orbify_sites.py ...`
-    # If run via Streamlit: `streamlit run orbify_sites.py`
-    import sys
-    if any("streamlit" in arg for arg in sys.argv[0:1]):
-        # Streamlit injects its runner; we call the app function above
+    # If launched by `streamlit run <this_file>`, run the Streamlit UI.
+    # Otherwise, behave as a normal CLI.
+    if _running_in_streamlit():
         streamlit_app()
     else:
         main()

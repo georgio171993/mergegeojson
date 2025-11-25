@@ -30,7 +30,7 @@ Notes
 
 Usage
 -----
-python orbify_sites.py \
+python sitesmerge.py \
   --inputs data/a.geojson data/b.geojson \
   --output out/sites_merged.geojson \
   --ratio-threshold 0.0011 \
@@ -285,12 +285,30 @@ def cluster_polygons(features: List[Feature], cluster_distance_m: float) -> List
     out: List[Feature] = others.copy()
     for cid, idxs in clusters.items():
         geoms = [polys[i].geom for i in idxs]
+
+        # --- PROPERTY MERGE FIX FOR UNHASHABLE TYPES ---
         props_merged: Dict = {}
-        common_keys = set.intersection(*(set(polys[i].props.keys()) for i in idxs)) if len(idxs) > 1 else set(polys[idxs[0]].props.keys())
-        for k in common_keys:
-            vals = {polys[i].props[k] for i in idxs}
-            if len(vals) == 1:
-                props_merged[k] = vals.pop()
+        if idxs:
+            # Start with keys from the first polygon
+            common_keys = set(polys[idxs[0]].props.keys())
+            # Intersection with keys of all other polygons in the cluster
+            for i in idxs[1:]:
+                common_keys.intersection_update(polys[i].props.keys())
+            
+            # For each common key, check if values are identical across all polygons
+            for k in common_keys:
+                val0 = polys[idxs[0]].props[k]
+                # Compare using equality (safe for lists/dicts) instead of sets
+                is_consistent = True
+                for i in idxs[1:]:
+                    if polys[i].props[k] != val0:
+                        is_consistent = False
+                        break
+                
+                if is_consistent:
+                    props_merged[k] = val0
+        # -----------------------------------------------
+
         props_merged["cluster_id"] = int(cid)
         if len(idxs) == 1:
             out.append(Feature(geoms[0], {**polys[idxs[0]].props, **props_merged}))
@@ -559,7 +577,7 @@ def main():
 
 
 # --- Streamlit UI ------------------------------------------------------------
-# Minimal UI so you can run `streamlit run orbify_sites.py` directly.
+# Minimal UI so you can run `streamlit run sitesmerge.py` directly.
 # Requires: pip install streamlit pydeck shapely pyproj
 
 def streamlit_app():
@@ -615,7 +633,9 @@ def streamlit_app():
                 )
             except Exception as e:
                 st.error(f"Processing failed: {e}")
-                raise
+                # We log the full trace to console, but in streamlit we just show the error string
+                logger.exception("Processing failed")
+                return
 
             # Read back result
             out_bytes = out_path.read_bytes()

@@ -1,48 +1,22 @@
 #!/usr/bin/env python3
 """
-GeoJSON MultiPolygon Grouper & Splitter (Orbify Rule) - with Dedupe + Ocean Check
-=================================================================================
+GeoJSON MultiPolygon Grouper & Splitter (Orbify Rule) - with Dedupe + Ocean Check + Statistics
+==============================================================================================
 
 Purpose
 -------
-- Ingest one or more GeoJSON files (Polygon / MultiPolygon; others pass through).
-- Apply Orbify-style spatial efficiency **only to MultiPolygon** features:
-    * total_area_ha / bbox_area_ha >= **threshold** → keep as **single site**
-    * total_area_ha / bbox_area_ha <  **threshold** → **split** into per-polygon sites
-  - **Threshold default:** `0.0011` (safer buffer where supported cutoff is 0.001).
-- **Ignore MultiPoint** for this rule (log a warning; completely skipped from ratio processing).
-- Optionally **cluster nearby Polygon sites** (across all inputs) into
-  **MultiPolygon** sites when polygons are within a proximity (e.g., 2 km).
-- **De-duplicate** geometries so only one copy remains. Deduping works for:
-  * Polygons that are exact/near duplicates of other Polygons.
-  * MultiPolygons that are duplicates of other MultiPolygons **or** equivalent
-    to an existing Polygon set (e.g., a single-Polygon MultiPolygon).
-  * Internal duplicates inside a MultiPolygon (drops repeated parts).
-- **Ocean check (optional):** if a landmask is provided, reject geometries that fall mostly in the ocean (configurable overlap ratio).
-- Export a clean GeoJSON FeatureCollection with final **Polygon**/**MultiPolygon** sites.
-
-Notes
------
-- Geodesic area via `pyproj.Geod` (hectares).
-- Distances & dedupe tolerance use a local AEQD projection (meters).
-- Metadata properties: `site_id`, `orbify_ratio`, `orbify_decision` ("single"/"split"),
-  `cluster_id` (if clustering), `area_ha`.
+- Ingest one or more GeoJSON files.
+- **Track Statistics:** Count inputs by type (Point, Polygon, etc.) and outputs.
+- Apply Orbify-style spatial efficiency **only to MultiPolygon** features.
+- **Ignore MultiPoint** for this rule.
+- Optionally **cluster nearby Polygon sites**.
+- **De-duplicate** geometries.
+- **Ocean check (optional)**.
+- Export a clean GeoJSON FeatureCollection.
 
 Usage
 -----
-python sitesmerge.py \
-  --inputs data/a.geojson data/b.geojson \
-  --output out/sites_merged.geojson \
-  --ratio-threshold 0.0011 \
-  --cluster-distance-m 2000 \
-  --dedupe-tolerance-m 1.0 \
-  --landmask data/land.geojson --min-land-overlap 0.95
-
-Dependencies
-------------
-  pip install shapely pyproj
-  # (for Streamlit UI) pip install streamlit pydeck
-
+python sitesmerge.py --inputs data/a.geojson --output out/merged.geojson ...
 """
 from __future__ import annotations
 
@@ -51,7 +25,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple, Set, Optional
+from typing import Dict, List, Tuple, Set, Optional, Any
 
 from shapely.geometry import (
     shape,
@@ -61,6 +35,8 @@ from shapely.geometry import (
     GeometryCollection,
     Point,
     LineString,
+    MultiPoint,
+    MultiLineString
 )
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union, transform as shp_transform
@@ -143,24 +119,50 @@ def shapely_transform_to_proj(geom: BaseGeometry, transformer: Transformer) -> B
     return shp_transform(_tx, geom)
 
 
+# --- Stats Helper -----------------------------------------------------------
+
+def get_feature_counts(features: List[Feature]) -> Dict[str, int]:
+    """Count occurrences of each geometry type."""
+    counts = {
+        "Polygon": 0,
+        "MultiPolygon": 0,
+        "Point": 0,
+        "MultiPoint": 0,
+        "LineString": 0,
+        "MultiLineString": 0,
+        "GeometryCollection": 0,
+        "Total": len(features)
+    }
+    for f in features:
+        gt = f.geom.geom_type
+        # If the geometry type isn't standard, default to just counting total
+        if gt in counts:
+            counts[gt] += 1
+    return counts
+
+
 # --- IO ---------------------------------------------------------------------
 
 def load_features(paths: List[Path]) -> List[Feature]:
     feats: List[Feature] = []
     for p in paths:
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if data.get("type") == "FeatureCollection":
-            for feat in data.get("features", []):
-                g = shape(feat.get("geometry")) if feat.get("geometry") else GeometryCollection()
-                props = feat.get("properties", {}) or {}
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("type") == "FeatureCollection":
+                for feat in data.get("features", []):
+                    g = shape(feat.get("geometry")) if feat.get("geometry") else GeometryCollection()
+                    props = feat.get("properties", {}) or {}
+                    feats.append(Feature(g, props))
+            elif data.get("type") == "Feature":
+                g = shape(data.get("geometry")) if data.get("geometry") else GeometryCollection()
+                props = data.get("properties", {}) or {}
                 feats.append(Feature(g, props))
-        elif data.get("type") == "Feature":
-            g = shape(data.get("geometry")) if data.get("geometry") else GeometryCollection()
-            props = data.get("properties", {}) or {}
-            feats.append(Feature(g, props))
-        else:
-            logger.warning("Unsupported top-level type in %s: %s", p, data.get("type"))
+            else:
+                logger.warning("Unsupported top-level type in %s: %s", p, data.get("type"))
+        except Exception as e:
+            logger.error(f"Error loading {p}: {e}")
+            
     logger.info("Loaded %d feature(s) from %d file(s)", len(feats), len(paths))
     return feats
 
@@ -182,10 +184,6 @@ def save_features(features: List[Feature], out_path: Path) -> None:
 # --- Orbify MultiPolygon rule ------------------------------------------------
 
 def apply_orbify_rule(features: List[Feature], ratio_threshold: float) -> List[Feature]:
-    """Apply the ratio rule to MultiPolygon features only; split when sparse.
-    MultiPoint features are logged and skipped for this logic (left unchanged).
-    Polygons pass through unchanged here (may be clustered later).
-    """
     result: List[Feature] = []
     for idx, feat in enumerate(features):
         geom = feat.geom
@@ -193,16 +191,12 @@ def apply_orbify_rule(features: List[Feature], ratio_threshold: float) -> List[F
 
         if gtype == "MultiPoint":
             new_props = dict(feat.props)
-            new_props.setdefault("notes", "")
-            new_props["notes"] = (new_props["notes"] + "; " if new_props["notes"] else "") + \
-                                  "MultiPoint ignored for ratio grouping"
-            logger.warning("Feature %d: MultiPoint ignored for ratio-based grouping", idx)
+            new_props["notes"] = (new_props.get("notes", "") + "; MultiPoint ignored for ratio").strip("; ")
             result.append(Feature(geom, new_props))
             continue
 
         if gtype == "MultiPolygon":
             polys: List[Polygon] = list(geom.geoms)
-            # Drop internal duplicates inside this MultiPolygon before ratio
             polys = _dedupe_polygons_in_list(polys)
             mp_clean = MultiPolygon(tuple(polys)) if len(polys) > 1 else polys[0]
 
@@ -216,7 +210,6 @@ def apply_orbify_rule(features: List[Feature], ratio_threshold: float) -> List[F
                 props["orbify_decision"] = "single"
                 result.append(Feature(mp_clean if isinstance(mp_clean, MultiPolygon) else mp_clean, props))
             else:
-                # Split into individual Polygon sites
                 for i, poly in enumerate(polys):
                     props = dict(feat.props)
                     props["orbify_ratio"] = round(ratio, 6)
@@ -225,19 +218,13 @@ def apply_orbify_rule(features: List[Feature], ratio_threshold: float) -> List[F
                     result.append(Feature(poly, props))
             continue
 
-        # Pass-through
         result.append(feat)
-
-    logger.info("Orbify rule processed: input=%d → output=%d", len(features), len(result))
     return result
 
 
 # --- Proximity clustering into MultiPolygons --------------------------------
 
 def cluster_polygons(features: List[Feature], cluster_distance_m: float) -> List[Feature]:
-    """Cluster Polygon features by proximity and output Polygon/MultiPolygon features.
-    Only Polygon features are clustered; MultiPolygons are kept as-is.
-    """
     if cluster_distance_m <= 0:
         return features
 
@@ -286,28 +273,23 @@ def cluster_polygons(features: List[Feature], cluster_distance_m: float) -> List
     for cid, idxs in clusters.items():
         geoms = [polys[i].geom for i in idxs]
 
-        # --- PROPERTY MERGE FIX FOR UNHASHABLE TYPES ---
+        # --- PROPERTY MERGE FIX (Safe for Lists) ---
         props_merged: Dict = {}
         if idxs:
-            # Start with keys from the first polygon
             common_keys = set(polys[idxs[0]].props.keys())
-            # Intersection with keys of all other polygons in the cluster
             for i in idxs[1:]:
                 common_keys.intersection_update(polys[i].props.keys())
             
-            # For each common key, check if values are identical across all polygons
             for k in common_keys:
                 val0 = polys[idxs[0]].props[k]
-                # Compare using equality (safe for lists/dicts) instead of sets
                 is_consistent = True
                 for i in idxs[1:]:
                     if polys[i].props[k] != val0:
                         is_consistent = False
                         break
-                
                 if is_consistent:
                     props_merged[k] = val0
-        # -----------------------------------------------
+        # -------------------------------------------
 
         props_merged["cluster_id"] = int(cid)
         if len(idxs) == 1:
@@ -323,7 +305,6 @@ def cluster_polygons(features: List[Feature], cluster_distance_m: float) -> List
 # --- DEDUPLICATION -----------------------------------------------------------
 
 def _quantize_projected(geom: BaseGeometry, transformer_to_proj: Transformer, transformer_to_wgs: Transformer, grid_m: float) -> BaseGeometry:
-    """Project → snap coordinates to grid → back to WGS84 to normalize small noise for dedupe."""
     if geom.is_empty:
         return geom
     g_proj = shapely_transform_to_proj(geom, transformer_to_proj)
@@ -331,12 +312,10 @@ def _quantize_projected(geom: BaseGeometry, transformer_to_proj: Transformer, tr
     def snap(val: float) -> float:
         return round(val / grid_m) * grid_m
 
-    # Apply snapping to all coordinates using a transform
     def _snapper(x, y, z=None):
         return (snap(x), snap(y)) if z is None else (snap(x), snap(y), z)
 
     g_snapped = shp_transform(_snapper, g_proj)
-    # Back to WGS84
     def _inv(x, y, z=None):
         X, Y = transformer_to_wgs.transform(x, y)
         return (X, Y) if z is None else (X, Y, z)
@@ -345,13 +324,7 @@ def _quantize_projected(geom: BaseGeometry, transformer_to_proj: Transformer, tr
 
 
 def _polygon_key(poly: Polygon) -> bytes:
-    # Normalize orientation & topology
     return poly.buffer(0).wkb
-
-
-def _multipolygon_key(mp: MultiPolygon) -> Tuple[bytes, ...]:
-    parts = sorted((_polygon_key(p) for p in mp.geoms))
-    return tuple(parts)
 
 
 def _dedupe_polygons_in_list(polys: List[Polygon]) -> List[Polygon]:
@@ -367,21 +340,9 @@ def _dedupe_polygons_in_list(polys: List[Polygon]) -> List[Polygon]:
 
 
 def dedupe_features(features: List[Feature], tolerance_m: float) -> List[Feature]:
-    """Drop duplicate Polygon/MultiPolygon features. Tolerance is used to normalize
-    nearly-identical coordinates in meters (projected snapping) before comparing.
-
-    Rules:
-    - Polygons compared by normalized topology (`buffer(0)` + optional snapping).
-    - MultiPolygons compared as sorted tuples of their polygon keys.
-    - If a MultiPolygon contains duplicate parts internally, they are removed.
-    - If a MultiPolygon reduces to a single polygon equal to an existing Polygon,
-      it is considered a duplicate and removed.
-    - Mixed duplicates (Polygon vs one-part MultiPolygon) are unified.
-    """
     if tolerance_m < 0:
         tolerance_m = 0.0
 
-    # Build projection centered on dataset for snapping
     lat0, lon0 = _dataset_center(features)
     aeqd = make_local_aeqd_crs(lon0, lat0)
     to_proj = Transformer.from_crs("EPSG:4326", aeqd, always_xy=True)
@@ -402,33 +363,24 @@ def dedupe_features(features: List[Feature], tolerance_m: float) -> List[Feature
         g = f.geom
         if isinstance(g, Polygon):
             k = _polygon_key(g)
-            if k in seen_poly:
-                continue
-            # also if any MultiPolygon key already consists solely of this polygon, skip
-            if (k,) in seen_mpoly:
-                continue
+            if k in seen_poly: continue
+            if (k,) in seen_mpoly: continue
             seen_poly.add(k)
             out.append(f)
         elif isinstance(g, MultiPolygon):
-            # drop internal dupes first
             parts = _dedupe_polygons_in_list(list(g.geoms))
             if len(parts) == 1:
                 k = _polygon_key(parts[0])
-                if k in seen_poly:
-                    continue
+                if k in seen_poly: continue
                 seen_poly.add(k)
                 out.append(Feature(parts[0], f.props))
             else:
                 k = tuple(sorted(_polygon_key(p) for p in parts))
-                if k in seen_mpoly:
-                    continue
-                # if an equivalent set already exists as polygons individually, treat as duplicate set
-                if all(pk in seen_poly for pk in k):
-                    continue
+                if k in seen_mpoly: continue
+                if all(pk in seen_poly for pk in k): continue
                 seen_mpoly.add(k)
                 out.append(Feature(MultiPolygon(tuple(parts)), f.props))
         else:
-            # Other geometry types: leave as-is (not considered for geometric dedupe)
             out.append(f)
 
     logger.info("Dedupe: input=%d → output=%d", len(features), len(out))
@@ -438,9 +390,6 @@ def dedupe_features(features: List[Feature], tolerance_m: float) -> List[Feature
 # --- OCEAN / LAND CHECK ------------------------------------------------------
 
 def load_landmask(path: Optional[Path]) -> Optional[BaseGeometry]:
-    """Load a landmask from a GeoJSON file (Feature or FeatureCollection). Returns a unified geometry.
-    The landmask should represent **land areas**. We unary_union all Polygon/MultiPolygon parts.
-    """
     if not path:
         return None
     try:
@@ -456,32 +405,20 @@ def load_landmask(path: Optional[Path]) -> Optional[BaseGeometry]:
             g = shape(data.get("geometry")) if data.get("geometry") else GeometryCollection()
             if isinstance(g, (Polygon, MultiPolygon)):
                 geoms.append(g)
-        else:
-            logger.warning("Unsupported landmask top-level type: %s", data.get("type"))
-            return None
-        if not geoms:
-            logger.warning("Landmask has no polygonal geometry; ocean check disabled")
-            return None
-        return unary_union(geoms)
+        return unary_union(geoms) if geoms else None
     except Exception as e:
         logger.error("Failed to load landmask: %s", e)
         return None
 
 
 def filter_ocean(features: List[Feature], landmask: BaseGeometry, min_overlap_ratio: float = 0.95) -> List[Feature]:
-    """Reject features that fall mostly in ocean using the provided landmask.
-    - Polygons/MultiPolygons: keep if area(intersection)/area >= min_overlap_ratio.
-    - Points/MultiPoints: keep if within landmask.
-    - LineStrings: keep if they intersect landmask (len > 0).
-    - Others: passed through.
-    """
     out: List[Feature] = []
     dropped = 0
     for f in features:
         g = f.geom
         try:
             if isinstance(g, (Polygon, MultiPolygon)):
-                a = g.area if g.area > 0 else 1.0  # planar proxy used only for ratio; exactness not critical
+                a = g.area if g.area > 0 else 1.0
                 inter = g.intersection(landmask)
                 ratio = 0.0 if g.is_empty else (inter.area / a)
                 if ratio >= min_overlap_ratio:
@@ -501,9 +438,8 @@ def filter_ocean(features: List[Feature], landmask: BaseGeometry, min_overlap_ra
             else:
                 out.append(f)
         except Exception:
-            # If geometry is invalid or operation fails, be conservative: drop
             dropped += 1
-    logger.info("Ocean check: dropped %d feature(s) that fall in ocean (min_overlap=%.2f)", dropped, min_overlap_ratio)
+    logger.info("Ocean check: dropped %d feature(s)", dropped)
     return out
 
 
@@ -517,25 +453,33 @@ def process(
     dedupe_tolerance_m: float = 1.0,
     landmask_path: Optional[Path] = None,
     min_land_overlap: float = 0.95,
-) -> None:
+) -> Dict[str, Any]:
+    
+    # 1. Load and Get Initial Stats
     feats = load_features(inputs)
+    initial_stats = get_feature_counts(feats)
 
-    # Apply Orbify rule on MultiPolygons (split vs keep)
+    # 2. Orbify Rule (Splits/Groups)
     feats = apply_orbify_rule(feats, ratio_threshold)
 
-    # Optional proximity-based clustering across Polygons
-    if cluster_distance_m and cluster_distance_m > 0:
+    # 3. Clustering
+    if cluster_distance_m > 0:
         feats = cluster_polygons(feats, cluster_distance_m)
 
-    # Global geometric de-duplication
+    # 4. Deduplication
+    count_before_dedupe = len(feats)
     feats = dedupe_features(feats, dedupe_tolerance_m)
+    dropped_dedupe = count_before_dedupe - len(feats)
 
-    # Optional ocean/land check
+    # 5. Ocean Check
+    dropped_ocean = 0
     landmask = load_landmask(landmask_path)
     if landmask is not None:
+        count_before_ocean = len(feats)
         feats = filter_ocean(feats, landmask, min_land_overlap)
+        dropped_ocean = count_before_ocean - len(feats)
 
-    # Assign site ids (stable index-based) & store area
+    # 6. Final Prep & Stats
     final = []
     for i, f in enumerate(feats):
         props = dict(f.props)
@@ -544,28 +488,37 @@ def process(
             props["area_ha"] = round(geodesic_area_ha(f.geom), 4)
         final.append(Feature(f.geom, props))
 
+    final_stats = get_feature_counts(final)
     save_features(final, output)
+
+    return {
+        "initial_counts": initial_stats,
+        "final_counts": final_stats,
+        "dropped_dedupe": dropped_dedupe,
+        "dropped_ocean": dropped_ocean,
+        "dropped_total": dropped_dedupe + dropped_ocean
+    }
 
 
 # --- CLI ---------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Orbify-style MultiPolygon grouping, clustering, deduplication, and ocean check for GeoJSON.")
-    ap.add_argument("--inputs", nargs="+", type=Path, required=True, help="One or more input GeoJSON files")
+    ap = argparse.ArgumentParser(description="Orbify GeoJSON Grouper with Stats")
+    ap.add_argument("--inputs", nargs="+", type=Path, required=True, help="Input GeoJSON files")
     ap.add_argument("--output", type=Path, required=True, help="Output GeoJSON path")
-    ap.add_argument("--ratio-threshold", type=float, default=0.0011, help="Threshold for area/bbox_area (default 0.0011 for a safe buffer > 0.001)")
-    ap.add_argument("--cluster-distance-m", type=float, default=0.0, help="Max distance (meters) to cluster polygons into MultiPolygons across inputs (0=off)")
-    ap.add_argument("--dedupe-tolerance-m", type=float, default=1.0, help="Snap grid in meters for near-duplicate removal (0=exact only)")
-    ap.add_argument("--landmask", type=Path, default=None, help="Optional landmask GeoJSON path for ocean rejection (Feature or FeatureCollection)")
-    ap.add_argument("--min-land-overlap", type=float, default=0.95, help="Min area overlap with landmask to accept polygonal features [0-1]")
-    ap.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging level")
+    ap.add_argument("--ratio-threshold", type=float, default=0.0011)
+    ap.add_argument("--cluster-distance-m", type=float, default=0.0)
+    ap.add_argument("--dedupe-tolerance-m", type=float, default=1.0)
+    ap.add_argument("--landmask", type=Path, default=None)
+    ap.add_argument("--min-land-overlap", type=float, default=0.95)
+    ap.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return ap.parse_args()
 
 
 def main():
     args = parse_args()
     logger.setLevel(getattr(logging, args.log_level))
-    process(
+    stats = process(
         inputs=args.inputs,
         output=args.output,
         ratio_threshold=args.ratio_threshold,
@@ -574,55 +527,51 @@ def main():
         landmask_path=args.landmask,
         min_land_overlap=args.min_land_overlap,
     )
+    print("Processing Complete.")
+    print(f"Initial: {stats['initial_counts']}")
+    print(f"Final:   {stats['final_counts']}")
+    print(f"Dropped: {stats['dropped_total']} (Dedupe={stats['dropped_dedupe']}, Ocean={stats['dropped_ocean']})")
 
 
 # --- Streamlit UI ------------------------------------------------------------
-# Minimal UI so you can run `streamlit run sitesmerge.py` directly.
-# Requires: pip install streamlit pydeck shapely pyproj
 
 def streamlit_app():
     import streamlit as st
     import tempfile
     import pydeck as pdk
+    import pandas as pd
 
     st.set_page_config(page_title="Orbify GeoJSON Grouper", layout="wide")
-    st.title("Orbify GeoJSON Grouper & Splitter (with Dedupe + Ocean Check)")
+    st.title("Orbify GeoJSON Grouper & Splitter (with Stats)")
 
     with st.sidebar:
         st.header("Parameters")
-        ratio = st.number_input("Ratio threshold (area/bbox)", value=0.0011, min_value=0.0, step=0.0001, format="%.4f")
-        cluster_m = st.number_input("Cluster distance (m)", value=2000.0, min_value=0.0, step=100.0)
-        dedupe_m = st.number_input("Dedupe tolerance (m)", value=1.0, min_value=0.0, step=0.5)
-        min_overlap = st.slider("Min land overlap (0-1)", min_value=0.0, max_value=1.0, value=0.95, step=0.01)
-        log_level = st.selectbox("Log level", ["DEBUG", "INFO", "WARNING", "ERROR"], index=1)
-        st.markdown("---")
-        uploaded = st.file_uploader("Upload GeoJSON files (one or more)", type=["json","geojson"], accept_multiple_files=True)
-        landmask_file = st.file_uploader("Optional landmask GeoJSON (polygons of LAND)", type=["json","geojson"], accept_multiple_files=False)
+        ratio = st.number_input("Ratio threshold", value=0.0011, format="%.4f")
+        cluster_m = st.number_input("Cluster distance (m)", value=2000.0, step=100.0)
+        dedupe_m = st.number_input("Dedupe tolerance (m)", value=1.0, step=0.5)
+        min_overlap = st.slider("Min land overlap", 0.0, 1.0, 0.95)
+        uploaded = st.file_uploader("Upload Inputs", type=["json","geojson"], accept_multiple_files=True)
+        landmask_file = st.file_uploader("Upload Landmask (Optional)", type=["json","geojson"])
         run_btn = st.button("Process")
 
-    logger.setLevel(getattr(logging, log_level))
-
-    if run_btn:
-        if not uploaded:
-            st.warning("Please upload at least one GeoJSON file.")
-            return
-
-        # Write uploads to temp files so we can reuse the existing pipeline
+    if run_btn and uploaded:
         tmp_paths = []
         with tempfile.TemporaryDirectory() as td:
             for uf in uploaded:
                 p = Path(td) / uf.name
                 p.write_bytes(uf.getvalue())
                 tmp_paths.append(p)
-
+            
             landmask_path = None
-            if landmask_file is not None:
+            if landmask_file:
                 landmask_path = Path(td) / ("landmask_" + landmask_file.name)
                 landmask_path.write_bytes(landmask_file.getvalue())
-
+            
             out_path = Path(td) / "sites_merged.geojson"
+            
             try:
-                process(
+                # RUN PIPELINE AND GET STATS
+                stats = process(
                     inputs=tmp_paths,
                     output=out_path,
                     ratio_threshold=ratio,
@@ -631,69 +580,66 @@ def streamlit_app():
                     landmask_path=landmask_path,
                     min_land_overlap=min_overlap,
                 )
+                
+                # --- DISPLAY STATS ---
+                st.subheader("Processing Statistics")
+                
+                # Create a comparison table for geometry types
+                init_c = stats["initial_counts"]
+                final_c = stats["final_counts"]
+                
+                # Determine all geometry types present
+                all_types = sorted(set(init_c.keys()) | set(final_c.keys()) - {"Total"})
+                
+                data = []
+                for t in all_types:
+                    data.append({
+                        "Geometry Type": t,
+                        "Input Count": init_c.get(t, 0),
+                        "Output Count": final_c.get(t, 0),
+                        "Difference": final_c.get(t, 0) - init_c.get(t, 0)
+                    })
+                
+                # Summary Metrics
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Total Input Features", init_c["Total"])
+                c2.metric("Total Output Features", final_c["Total"])
+                c3.metric("Total Missed/Dropped", stats["dropped_total"], 
+                          help=f"Dedupe: {stats['dropped_dedupe']}, Ocean: {stats['dropped_ocean']}")
+
+                st.table(pd.DataFrame(data).set_index("Geometry Type"))
+                
+                # --- MAP & DOWNLOAD ---
+                out_bytes = out_path.read_bytes()
+                out_json = json.loads(out_bytes.decode("utf-8"))
+                
+                st.download_button("Download Result", out_bytes, "sites_merged.geojson", "application/geo+json")
+                
+                st.subheader("Map Preview")
+                try:
+                    layer = pdk.Layer("GeoJsonLayer", data=out_json, pickable=True, stroked=True, filled=True, wireframe=True)
+                    view_state = pdk.ViewState(latitude=0, longitude=0, zoom=1)
+                    if out_json["features"]:
+                         # Centering logic simplified
+                         from shapely.geometry import shape as s_shape
+                         c = s_shape(out_json["features"][0]["geometry"]).centroid
+                         view_state = pdk.ViewState(latitude=c.y, longitude=c.x, zoom=6)
+                    st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view_state))
+                except Exception:
+                    st.warning("Map preview unavailable.")
+
             except Exception as e:
-                st.error(f"Processing failed: {e}")
-                # We log the full trace to console, but in streamlit we just show the error string
-                logger.exception("Processing failed")
-                return
-
-            # Read back result
-            out_bytes = out_path.read_bytes()
-            out_json = json.loads(out_bytes.decode("utf-8"))
-
-            # Show quick stats
-            feats = out_json.get("features", [])
-            n_poly = sum(1 for f in feats if (f.get("geometry") or {}).get("type") == "Polygon")
-            n_mpoly = sum(1 for f in feats if (f.get("geometry") or {}).get("type") == "MultiPolygon")
-
-            st.success(f"Processed {len(uploaded)} file(s). Output features: {len(feats)} (Polygon={n_poly}, MultiPolygon={n_mpoly}).")
-
-            # Map preview via pydeck GeoJsonLayer
-            st.subheader("Preview")
-            try:
-                layer = pdk.Layer(
-                    "GeoJsonLayer",
-                    data=out_json,
-                    pickable=True,
-                    stroked=True,
-                    filled=True,
-                    extruded=False,
-                    wireframe=False,
-                )
-                view_state = pdk.ViewState(latitude=0, longitude=0, zoom=1)
-                if feats:
-                    try:
-                        from shapely.geometry import shape as _shape
-                        first = _shape(feats[0].get("geometry"))
-                        c = first.centroid
-                        view_state = pdk.ViewState(latitude=c.y, longitude=c.x, zoom=6)
-                    except Exception:
-                        pass
-                st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view_state, map_style=None))
-            except Exception as _e:
-                st.info("Map preview not available (pydeck error). You can still download the output.")
-
-            # Download button
-            st.download_button(
-                label="Download merged GeoJSON",
-                data=out_bytes,
-                file_name="sites_merged.geojson",
-                mime="application/geo+json",
-            )
-
+                st.error(f"Error: {e}")
+                logger.exception("Streamlit Error")
 
 def _running_in_streamlit() -> bool:
-    """Detect if this file is being executed by Streamlit."""
     try:
-        from streamlit.runtime.scriptrunner import get_script_run_ctx  # type: ignore
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
         return get_script_run_ctx() is not None
     except Exception:
         return False
 
-
 if __name__ == "__main__":
-    # If launched by `streamlit run <this_file>`, run the Streamlit UI.
-    # Otherwise, behave as a normal CLI.
     if _running_in_streamlit():
         streamlit_app()
     else:
